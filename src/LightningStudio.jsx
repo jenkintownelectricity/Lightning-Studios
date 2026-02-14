@@ -1232,6 +1232,8 @@ Write album-quality lyrics. Every bar must earn its place. No filler. No placeho
         artistName={brief.artistName}
         onBounce={handleBeatBounce}
         onExportKernel={handleBeatKernelExport}
+        apiKey={apiKey}
+        onNeedApiKey={() => setShowApiKeyInput(true)}
       />
     </div>
   );
