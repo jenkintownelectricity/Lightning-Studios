@@ -1,8 +1,9 @@
 import { useState, useRef, useEffect, useCallback } from "react";
+import BeatEngine from "./BeatEngine.jsx";
 
 // ═══════════════════════════════════════════════════════════
 // ⚡ LIGHTNING STUDIO — Music Production Kernel
-// L0-CMD-2026-0214-003 | Armand Lefebvre | Greedy One-Shot
+// L0-CMD-2026-0214-003 + L0-CMD-2026-0214-005 | Beat Kernel Integration
 // ═══════════════════════════════════════════════════════════
 
 const GENRES = [
@@ -191,6 +192,9 @@ export default function LightningStudio() {
   // Recording timer
   const [recordingTime, setRecordingTime] = useState(0);
   const recordingTimerRef = useRef(null);
+
+  // Beat Kernel state
+  const [beatKernel, setBeatKernel] = useState(null);
 
   // ── Brief Handlers ──
   const updateBrief = (k, v) => setBrief(p => ({ ...p, [k]: v }));
@@ -483,6 +487,65 @@ Write album-quality lyrics. Every bar must earn its place. No filler. No placeho
     URL.revokeObjectURL(url);
   };
 
+  // ── Beat Bounce Handler ──
+  const handleBeatBounce = (audioBuffer, beatName) => {
+    const id = Date.now().toString();
+    setBeats(p => [...p, { id, file: null, buffer: audioBuffer, name: beatName || "Beat Bounce" }]);
+    setTab("studio");
+  };
+
+  const handleBeatKernelExport = (kernel) => {
+    setBeatKernel(kernel);
+  };
+
+  // ── Export Complete Production Genome ──
+  const exportGenome = () => {
+    const genome = {
+      production_genome_version: "1.0.0",
+      created: new Date().toISOString(),
+      artist: brief.artistName,
+      song_kernel: {
+        schema_version: "song-kernel-v1.1",
+        brief_id: `SB-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}`,
+        artist: {
+          name: brief.artistName,
+          vocal_style: brief.vocalStyle,
+          influences: brief.influences.split(",").map(s => s.trim()).filter(Boolean),
+        },
+        song: {
+          title: brief.title,
+          genre: selectedGenre.label,
+          bpm: brief.bpm,
+          key: brief.musicalKey,
+          mood_tags: brief.moods,
+          thematic_core: brief.thematicCore,
+          structure: brief.structure,
+          city_setting: brief.cityRef,
+          cultural_references: brief.culturalRefs.split(",").map(s => s.trim()).filter(Boolean),
+          emotional_arc: {
+            opening: brief.emotionOpen, midpoint: brief.emotionMid,
+            climax: brief.emotionClimax, resolution: brief.emotionResolve,
+          },
+          beat_kernel_ref: beatKernel ? {
+            beat_id: beatKernel.metadata?.beat_id || null,
+            beat_kernel_version: "beat-kernel-v1",
+            relationship: "produced_for",
+            notes: "Beat produced within Lightning Studio session",
+          } : undefined,
+        },
+      },
+      beat_kernel: beatKernel || undefined,
+      lyrics,
+      vocal_takes: recordings.map(r => ({ name: r.name, format: "wav", duration_sec: r.buffer?.duration || 0 })),
+      mix_settings: { tracks: tracks.map(t => ({ name: t.name, type: t.type, volume: t.volume, pan: t.pan, muted: t.muted, solo: t.solo })) },
+    };
+    const blob = new Blob([JSON.stringify(genome, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `production-genome-${brief.title || "untitled"}.json`; a.click();
+    URL.revokeObjectURL(url);
+  };
+
   const exportProject = () => {
     const project = {
       schema_version: "lightning-studio-project-v1",
@@ -514,6 +577,7 @@ Write album-quality lyrics. Every bar must earn its place. No filler. No placeho
       },
       lyrics: lyrics,
       tracks: tracks.map(t => ({ name: t.name, type: t.type, volume: t.volume, pan: t.pan, muted: t.muted, solo: t.solo })),
+      beat_kernel: beatKernel || undefined,
       exported_at: new Date().toISOString(),
     };
     const blob = new Blob([JSON.stringify(project, null, 2)], { type: "application/json" });
@@ -1082,6 +1146,35 @@ Write album-quality lyrics. Every bar must earn its place. No filler. No placeho
           </div>
         </div>
 
+        {/* Beat Kernel Export */}
+        <div style={{ ...S.card, marginBottom: 16 }}>
+          <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 12, color: "#f59e0b" }}>Beat Kernel (Beat DNA)</div>
+          {beatKernel ? (
+            <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+              <button style={S.btn("primary")} onClick={() => {
+                const blob = new Blob([JSON.stringify(beatKernel, null, 2)], { type: "application/json" });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement("a"); a.href = url;
+                a.download = `beat-kernel-${beatKernel.metadata?.name || "untitled"}.json`; a.click(); URL.revokeObjectURL(url);
+              }}>Download Beat Kernel JSON</button>
+              <span style={{ fontSize: 12, color: "#888" }}>
+                {beatKernel.metadata?.name || "Untitled"} | {beatKernel.transport?.bpm}bpm | {beatKernel.transport?.key} {beatKernel.transport?.scale}
+              </span>
+            </div>
+          ) : (
+            <p style={{ fontSize: 12, color: "#666", margin: 0 }}>No beat kernel yet. Go to <span style={{ color: "#f59e0b", cursor: "pointer" }} onClick={() => setTab("beats")}>Beats</span> and export a kernel.</p>
+          )}
+        </div>
+
+        {/* Complete Production Genome */}
+        <div style={{ ...S.card, marginBottom: 16 }}>
+          <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 12, color: "#f59e0b" }}>Complete Production Genome</div>
+          <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+            <button style={S.btn("success")} onClick={exportGenome}>Download Production Genome</button>
+            <span style={{ fontSize: 12, color: "#888", alignSelf: "center" }}>Song Kernel + Beat Kernel + Lyrics + Mix — the entire production DNA</span>
+          </div>
+        </div>
+
         {/* Individual Recordings Export */}
         {recordings.length > 0 && (
           <div style={{ ...S.card, marginBottom: 16 }}>
@@ -1128,9 +1221,25 @@ Write album-quality lyrics. Every bar must earn its place. No filler. No placeho
   // ═══════════════════════════════════════════════════════════
   // APP SHELL
   // ═══════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════
+  // TAB: BEATS (Lightning Beats Engine)
+  // ═══════════════════════════════════════════════════════════
+  const renderBeats = () => (
+    <div style={{ animation: "fadeIn 0.3s ease" }}>
+      <BeatEngine
+        briefBpm={brief.bpm}
+        briefKey={brief.musicalKey ? brief.musicalKey.replace("m","").replace("b","") : "C"}
+        artistName={brief.artistName}
+        onBounce={handleBeatBounce}
+        onExportKernel={handleBeatKernelExport}
+      />
+    </div>
+  );
+
   const tabLabels = {
     brief: "Brief",
     lyrics: "Lyrics",
+    beats: "Beats",
     studio: "Studio",
     mix: "Mix",
     export: "Export",
@@ -1164,6 +1273,7 @@ Write album-quality lyrics. Every bar must earn its place. No filler. No placeho
       <main style={S.main}>
         {tab === "brief" && renderBrief()}
         {tab === "lyrics" && renderLyrics()}
+        {tab === "beats" && renderBeats()}
         {tab === "studio" && renderStudio()}
         {tab === "mix" && renderMix()}
         {tab === "export" && renderExport()}
@@ -1172,7 +1282,7 @@ Write album-quality lyrics. Every bar must earn its place. No filler. No placeho
       {/* Footer */}
       <footer style={{ padding: "16px 32px", borderTop: "1px solid #1a1a2e", display: "flex", justifyContent: "space-between", alignItems: "center", position: "relative", zIndex: 2 }}>
         <span style={{ fontSize: 10, color: "#444", letterSpacing: 2 }}>LIGHTNING STUDIO — LEFEBVRE DESIGN SOLUTIONS LLC</span>
-        <span style={{ fontSize: 10, color: "#444", letterSpacing: 2 }}>L0-CMD-2026-0214-003 | VALIDKERNEL GOVERNED</span>
+        <span style={{ fontSize: 10, color: "#444", letterSpacing: 2 }}>L0-CMD-2026-0214-003 + 005 | BEAT KERNEL v1 | VALIDKERNEL GOVERNED</span>
       </footer>
     </div>
   );
