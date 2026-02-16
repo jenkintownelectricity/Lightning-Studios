@@ -438,7 +438,7 @@ function routeToMaster(actx, chain, mixer, velocity) {
 // ═══════════════════════════════════════════════════════════
 // BEAT ENGINE COMPONENT
 // ═══════════════════════════════════════════════════════════
-export default function BeatEngine({ briefBpm, briefKey, onBounce, onExportKernel, artistName }) {
+export default function BeatEngine({ briefBpm, briefKey, onBounce, onExportKernel, artistName, apiKey, onNeedApiKey }) {
   const [transport, setTransport] = useState({ bpm: briefBpm || 90, swing: 0.15, time_signature: "4/4", key: briefKey || "C", scale: "minor", steps_per_pattern: 16 });
   const [drums, setDrums] = useState(() => defaultDrums());
   const [instruments, setInstruments] = useState(() => defaultInstruments());
@@ -450,6 +450,8 @@ export default function BeatEngine({ briefBpm, briefKey, onBounce, onExportKerne
   const [view, setView] = useState("drums"); // drums | instruments | mixer | master
   const [beatName, setBeatName] = useState("Untitled Beat");
   const [bouncing, setBouncing] = useState(false);
+  const [aiPrompt, setAiPrompt] = useState("");
+  const [aiGenerating, setAiGenerating] = useState(false);
 
   const actxRef = useRef(null);
   const chainRef = useRef(null);
@@ -641,6 +643,121 @@ export default function BeatEngine({ briefBpm, briefKey, onBounce, onExportKerne
     e.target.value = "";
   }, []);
 
+  // ── AI Beat Generation ──
+  const generateBeatFromAI = useCallback(async () => {
+    if (!apiKey || !apiKey.trim()) {
+      if (onNeedApiKey) onNeedApiKey();
+      return;
+    }
+    if (!aiPrompt.trim()) return;
+    setAiGenerating(true);
+    if (playing) stopPlayback();
+
+    const sysPrompt = `You are an expert beat producer and music programmer. Given a description of a beat, you output a JSON object that defines the complete beat pattern. You MUST output ONLY valid JSON — no markdown, no explanation, no code fences.
+
+The JSON must match this exact structure:
+{
+  "transport": { "bpm": <40-200>, "swing": <0-0.5>, "time_signature": "4/4", "key": "<C|C#|D|D#|E|F|F#|G|G#|A|A#|B>", "scale": "<major|minor|dorian|phrygian|mixolydian|blues|pentatonic>", "steps_per_pattern": 16 },
+  "drums": [
+    { "id": "kick", "name": "Kick", "enabled": true, "pattern": [0 or 1 for each of 16 steps], "velocities": [0.0-1.0 for each of 16 steps] },
+    { "id": "snare", "name": "Snare", "enabled": true, "pattern": [...], "velocities": [...] },
+    { "id": "hihat_closed", "name": "HH Closed", "enabled": true, "pattern": [...], "velocities": [...] },
+    { "id": "hihat_open", "name": "HH Open", "enabled": true, "pattern": [...], "velocities": [...] },
+    { "id": "clap", "name": "Clap", "enabled": true, "pattern": [...], "velocities": [...] },
+    { "id": "rim", "name": "Rim", "enabled": true, "pattern": [...], "velocities": [...] },
+    { "id": "tom", "name": "Tom", "enabled": true, "pattern": [...], "velocities": [...] },
+    { "id": "crash", "name": "Crash", "enabled": true, "pattern": [...], "velocities": [...] }
+  ],
+  "instruments": [
+    { "id": "bass", "name": "Bass", "notes": [{ "step": <0-15>, "midi_note": <24-48>, "note_name": "<e.g. C2>", "length_steps": <1-16>, "velocity": <0.1-1.0> }, ...] },
+    { "id": "piano", "name": "Piano", "notes": [...] },
+    { "id": "strings", "name": "Strings", "notes": [...] },
+    { "id": "lead", "name": "Lead", "notes": [...] },
+    { "id": "pluck", "name": "Pluck", "notes": [...] }
+  ],
+  "beat_name": "<creative name for the beat>"
+}
+
+Rules:
+- pattern arrays must be exactly 16 elements of 0 or 1
+- velocities arrays must be exactly 16 elements, 0.0-1.0
+- Use appropriate BPM for the genre (trap/drill: 130-150, boom bap: 80-100, lofi: 70-85, etc.)
+- Make the drum patterns musical and genre-appropriate
+- Add bass notes and at least one melodic instrument
+- Keep midi_note values in reasonable ranges (bass: 24-48, piano/keys: 48-72, strings: 48-72, lead: 60-84, pluck: 60-96)
+- Make it sound good! Be creative with rhythm and melody.`;
+
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKey.trim(),
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+        },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514",
+          max_tokens: 4000,
+          system: sysPrompt,
+          messages: [{ role: "user", content: `Create a beat matching this description: ${aiPrompt}` }],
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error?.message || `API error ${res.status}`);
+      }
+      const data = await res.json();
+      const text = data.content?.map(b => b.type === "text" ? b.text : "").join("") || "";
+      // Extract JSON from response (strip any markdown fences if present)
+      const jsonStr = text.replace(/^```(?:json)?\s*/m, "").replace(/```\s*$/m, "").trim();
+      const beat = JSON.parse(jsonStr);
+
+      // Apply transport
+      if (beat.transport) {
+        setTransport(t => ({
+          ...t,
+          bpm: Math.max(40, Math.min(200, beat.transport.bpm || t.bpm)),
+          swing: beat.transport.swing ?? t.swing,
+          key: beat.transport.key || t.key,
+          scale: beat.transport.scale || t.scale,
+        }));
+      }
+
+      // Apply drums
+      if (beat.drums && Array.isArray(beat.drums)) {
+        setDrums(prev => prev.map((ch, ci) => {
+          const aiCh = beat.drums[ci] || beat.drums.find(d => d.id === ch.id);
+          if (!aiCh) return ch;
+          const newSteps = ch.pattern.steps.map((s, si) => ({
+            active: aiCh.pattern?.[si] === 1,
+            velocity: aiCh.velocities?.[si] ?? 0.8,
+          }));
+          return { ...ch, enabled: aiCh.enabled !== false, pattern: { steps: newSteps } };
+        }));
+      }
+
+      // Apply instruments
+      if (beat.instruments && Array.isArray(beat.instruments)) {
+        setInstruments(prev => prev.map((ch, ci) => {
+          const aiCh = beat.instruments[ci] || beat.instruments.find(inst => inst.id === ch.id);
+          if (!aiCh || !aiCh.notes) return ch;
+          const notes = aiCh.notes.map(n => ({
+            step: n.step, midi_note: n.midi_note,
+            note_name: n.note_name || midiToName(n.midi_note),
+            length_steps: n.length_steps || 1, velocity: n.velocity || 0.7,
+          }));
+          return { ...ch, notes };
+        }));
+      }
+
+      if (beat.beat_name) setBeatName(beat.beat_name);
+    } catch (e) {
+      alert("AI Beat Generation error: " + e.message);
+    }
+    setAiGenerating(false);
+  }, [apiKey, aiPrompt, playing, stopPlayback, onNeedApiKey]);
+
   // ── Load Preset ──
   const loadPreset = (presetFn) => {
     if (playing) stopPlayback();
@@ -726,8 +843,11 @@ export default function BeatEngine({ briefBpm, briefKey, onBounce, onExportKerne
     <div style={S.wrap}>
       {/* ── Transport Bar ── */}
       <div style={{ ...S.card, display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
-        <button style={S.btn(playing ? "danger" : "success")} onClick={playing ? stopPlayback : startPlayback}>
-          {playing ? "STOP" : "PLAY"}
+        <button style={S.btn("success")} onClick={startPlayback} disabled={playing}>
+          PLAY
+        </button>
+        <button style={S.btn("danger")} onClick={stopPlayback} disabled={!playing}>
+          STOP
         </button>
         <div>
           <span style={S.label}>BPM</span>
@@ -775,6 +895,28 @@ export default function BeatEngine({ briefBpm, briefKey, onBounce, onExportKerne
         {PRESETS.map((pf, i) => (
           <button key={i} style={S.chip(false)} onClick={() => loadPreset(pf)}>{pf().label}</button>
         ))}
+      </div>
+
+      {/* ── AI Beat Generator ── */}
+      <div style={{ ...S.card, display: "flex", alignItems: "flex-end", gap: 12, flexWrap: "wrap" }}>
+        <div style={{ flex: 1, minWidth: 250 }}>
+          <span style={{ ...S.label, color: "#a855f7" }}>AI Beat Generator</span>
+          <input
+            style={{ ...S.input, borderColor: aiGenerating ? "#a855f7" : "#222244" }}
+            value={aiPrompt}
+            onChange={e => setAiPrompt(e.target.value)}
+            onKeyDown={e => { if (e.key === "Enter" && !aiGenerating) generateBeatFromAI(); }}
+            placeholder="Describe a beat... e.g. 'dark trap with fast hi-hats and deep 808s'"
+            disabled={aiGenerating}
+          />
+        </div>
+        <button
+          style={{ ...S.btn("primary"), background: "#a855f7", whiteSpace: "nowrap" }}
+          onClick={generateBeatFromAI}
+          disabled={aiGenerating || !aiPrompt.trim()}
+        >
+          {aiGenerating ? "Generating..." : "AI Generate"}
+        </button>
       </div>
 
       {/* ── View Tabs ── */}
