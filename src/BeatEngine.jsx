@@ -1,8 +1,11 @@
 import { useState, useRef, useEffect, useCallback } from "react";
+import { applyGroove, SeededRNG, createDefaultGrooveProfile } from './grooveEngine.js';
+import { GROOVE_PRESETS, GROOVE_PRESET_MAP } from './grooveProfiles.js';
 
 // ═══════════════════════════════════════════════════════════
 // LIGHTNING BEATS — Beat Production Engine
-// Beat Kernel v1 | Part of Lightning Studio
+// Beat Kernel v1 | Groove Physics Engine v2.0
+// Part of Lightning Studio
 // ═══════════════════════════════════════════════════════════
 
 // ── Constants ──
@@ -447,26 +450,36 @@ export default function BeatEngine({ briefBpm, briefKey, onBounce, onExportKerne
   const [currentStep, setCurrentStep] = useState(-1);
   const [activeInstTab, setActiveInstTab] = useState(0);
   const [drawVelocity, setDrawVelocity] = useState(0.8);
-  const [view, setView] = useState("drums"); // drums | instruments | mixer | master
+  const [view, setView] = useState("drums"); // drums | instruments | mixer | master | groove
   const [beatName, setBeatName] = useState("Untitled Beat");
   const [bouncing, setBouncing] = useState(false);
   const [aiPrompt, setAiPrompt] = useState("");
   const [aiGenerating, setAiGenerating] = useState(false);
+
+  // ── Groove Physics Engine State ──
+  const [grooveProfile, setGrooveProfile] = useState(() => createDefaultGrooveProfile(briefBpm || 90));
+  const [groovePresetIdx, setGroovePresetIdx] = useState(0);
+  const [grooveEnabled, setGrooveEnabled] = useState(true);
 
   const actxRef = useRef(null);
   const chainRef = useRef(null);
   const schedulerRef = useRef(null);
   const stepRef = useRef(0);
   const nextTimeRef = useRef(0);
+  const barRef = useRef(0);
+  const rngRef = useRef(new SeededRNG(42));
+  const lofiNodeRef = useRef(null);
   const drumsRef = useRef(drums);
   const instRef = useRef(instruments);
   const masterRef = useRef(master);
   const transportRef = useRef(transport);
+  const grooveProfileRef = useRef(grooveProfile);
 
   useEffect(() => { drumsRef.current = drums; }, [drums]);
   useEffect(() => { instRef.current = instruments; }, [instruments]);
   useEffect(() => { masterRef.current = master; }, [master]);
   useEffect(() => { transportRef.current = transport; }, [transport]);
+  useEffect(() => { grooveProfileRef.current = grooveProfile; }, [grooveProfile]);
 
   // Sync BPM/key from brief when changed
   useEffect(() => {
@@ -476,21 +489,34 @@ export default function BeatEngine({ briefBpm, briefKey, onBounce, onExportKerne
     if (briefKey && !playing) setTransport(t => ({ ...t, key: briefKey }));
   }, [briefKey]);
 
-  // ── Scheduler ──
+  // ── Scheduler (with Groove Physics Engine) ──
   const scheduleStep = useCallback((step, time, actx, chain) => {
     const dr = drumsRef.current;
     const ins = instRef.current;
     const tr = transportRef.current;
+    const gp = grooveProfileRef.current;
+    const rng = rngRef.current;
+    const barIndex = barRef.current;
     const hasSoloD = dr.some(c => c.mixer.solo);
     const hasSoloI = ins.some(c => c.mixer.solo);
+
+    // Update groove profile BPM to match transport
+    const activeProfile = gp ? { ...gp, bpm: tr.bpm } : null;
 
     dr.forEach(ch => {
       if (!ch.enabled || ch.mixer.mute) return;
       if (hasSoloD && !ch.mixer.solo) return;
       const s = ch.pattern.steps[step];
       if (s && s.active) {
-        const dest = routeToMaster(actx, chain, ch.mixer, s.velocity);
-        synthDrum(actx, dest, time, ch.synthesis, s.velocity);
+        // Apply groove displacement per channel
+        const groove = applyGroove(
+          time, step, ch.id, activeProfile, barIndex,
+          rng, tr.scale, s.velocity
+        );
+        if (!groove.shouldPlay) return;
+        const finalVel = groove.velocity != null ? groove.velocity : s.velocity;
+        const dest = routeToMaster(actx, chain, ch.mixer, finalVel);
+        synthDrum(actx, dest, groove.time, ch.synthesis, finalVel);
       }
     });
 
@@ -501,19 +527,56 @@ export default function BeatEngine({ briefBpm, briefKey, onBounce, onExportKerne
       ch.notes.forEach(n => {
         if (n.step === step) {
           const dur = n.length_steps * secPerStep;
-          const dest = routeToMaster(actx, chain, ch.mixer, n.velocity);
-          synthNote(actx, dest, time, n.midi_note, dur, ch.synthesis, n.velocity);
+          // Apply groove displacement for instrument channels
+          const groove = applyGroove(
+            time, step, ch.id, activeProfile, barIndex,
+            rng, tr.scale, n.velocity
+          );
+          const finalVel = groove.velocity != null ? groove.velocity : n.velocity;
+          const dest = routeToMaster(actx, chain, ch.mixer, finalVel);
+          synthNote(actx, dest, groove.time, n.midi_note, dur, ch.synthesis, finalVel);
         }
       });
     });
   }, []);
 
-  const startPlayback = useCallback(() => {
+  const startPlayback = useCallback(async () => {
     if (playing) return;
     const actx = new (window.AudioContext || window.webkitAudioContext)();
     actxRef.current = actx;
+
+    // Initialize lo-fi AudioWorklet for hardware_emulated profiles
+    const gp = grooveProfileRef.current;
+    if (gp?.groove_type === 'hardware_emulated' && gp?.hardware_emulation?.dac_saturation?.enabled) {
+      try {
+        const workletUrl = new URL('./lofi-processor.worklet.js', import.meta.url).href;
+        await actx.audioWorklet.addModule(workletUrl);
+        const lofiNode = new AudioWorkletNode(actx, 'lofi-processor');
+        lofiNode.parameters.get('enabled').value = 1;
+        lofiNode.parameters.get('saturationEnabled').value = gp.hardware_emulation.dac_saturation.enabled ? 1 : 0;
+        lofiNode.parameters.get('saturationGain').value = gp.hardware_emulation.dac_saturation.gain || 1.2;
+        lofiNode.parameters.get('targetSampleRate').value = gp.hardware_emulation.sample_rate || 26040;
+        lofiNode.parameters.get('bitDepth').value = gp.hardware_emulation.bit_depth || 12;
+        lofiNode.parameters.get('downsampleEnabled').value = 1;
+        lofiNodeRef.current = lofiNode;
+      } catch (e) {
+        // AudioWorklet not supported — continue without lo-fi processing
+        lofiNodeRef.current = null;
+      }
+    }
+
     const chain = buildMasterChain(actx, masterRef.current);
+    // Insert lo-fi worklet into chain if available
+    if (lofiNodeRef.current) {
+      chain.masterGain.disconnect();
+      chain.masterGain.connect(lofiNodeRef.current);
+      lofiNodeRef.current.connect(actx.destination);
+    }
     chainRef.current = chain;
+
+    // Reset groove engine state (RULE 7: RNG resets at transport start)
+    rngRef.current.reset(gp?.randomization_seed || 42);
+    barRef.current = 0;
     stepRef.current = 0;
     nextTimeRef.current = actx.currentTime + 0.05;
     setPlaying(true);
@@ -535,7 +598,12 @@ export default function BeatEngine({ briefBpm, briefKey, onBounce, onExportKerne
         } else {
           nextTimeRef.current += secPerStep * (1 + swing);
         }
-        stepRef.current = (step + 1) % tr.steps_per_pattern;
+        const nextStep = (step + 1) % tr.steps_per_pattern;
+        // Track bar index for groove field (Layer 2) computations
+        if (nextStep === 0) {
+          barRef.current += 1;
+        }
+        stepRef.current = nextStep;
       }
       schedulerRef.current = setTimeout(tick, LOOKAHEAD);
     };
@@ -544,16 +612,19 @@ export default function BeatEngine({ briefBpm, briefKey, onBounce, onExportKerne
 
   const stopPlayback = useCallback(() => {
     if (schedulerRef.current) clearTimeout(schedulerRef.current);
+    if (lofiNodeRef.current) { try { lofiNodeRef.current.disconnect(); } catch(e){} lofiNodeRef.current = null; }
     if (actxRef.current) { try { actxRef.current.close(); } catch(e){} }
     actxRef.current = null; chainRef.current = null;
     setPlaying(false); setCurrentStep(-1);
   }, []);
 
-  // ── Bounce ──
+  // ── Bounce (with Groove Physics Engine) ──
   const bounceBeat = useCallback(async () => {
     setBouncing(true);
     try {
       const tr = transport;
+      const gp = grooveProfile ? { ...grooveProfile, bpm: tr.bpm } : null;
+      const bounceRng = new SeededRNG(gp?.randomization_seed || 42);
       const secPerStep = 60 / tr.bpm / 4;
       const totalSteps = tr.steps_per_pattern;
       const duration = totalSteps * secPerStep + 2;
@@ -566,6 +637,7 @@ export default function BeatEngine({ briefBpm, briefKey, onBounce, onExportKerne
 
       for (let step = 0; step < totalSteps; step++) {
         const swingOff = transport.swing || 0;
+        const barIndex = Math.floor(step / 16);
         let time = 0;
         for (let s = 0; s < step; s++) {
           time += s % 2 === 0 ? secPerStep * (1 - swingOff) : secPerStep * (1 + swingOff);
@@ -576,8 +648,11 @@ export default function BeatEngine({ briefBpm, briefKey, onBounce, onExportKerne
           if (hasSoloD && !ch.mixer.solo) return;
           const st = ch.pattern.steps[step];
           if (st && st.active) {
-            const dest = routeToMaster(offCtx, chain, ch.mixer, st.velocity);
-            synthDrum(offCtx, dest, time, ch.synthesis, st.velocity);
+            const groove = applyGroove(time, step, ch.id, gp, barIndex, bounceRng, tr.scale, st.velocity);
+            if (!groove.shouldPlay) return;
+            const finalVel = groove.velocity != null ? groove.velocity : st.velocity;
+            const dest = routeToMaster(offCtx, chain, ch.mixer, finalVel);
+            synthDrum(offCtx, dest, groove.time, ch.synthesis, finalVel);
           }
         });
 
@@ -587,8 +662,10 @@ export default function BeatEngine({ briefBpm, briefKey, onBounce, onExportKerne
           ch.notes.forEach(n => {
             if (n.step === step) {
               const dur = n.length_steps * secPerStep;
-              const dest = routeToMaster(offCtx, chain, ch.mixer, n.velocity);
-              synthNote(offCtx, dest, time, n.midi_note, dur, ch.synthesis, n.velocity);
+              const groove = applyGroove(time, step, ch.id, gp, barIndex, bounceRng, tr.scale, n.velocity);
+              const finalVel = groove.velocity != null ? groove.velocity : n.velocity;
+              const dest = routeToMaster(offCtx, chain, ch.mixer, finalVel);
+              synthNote(offCtx, dest, groove.time, n.midi_note, dur, ch.synthesis, finalVel);
             }
           });
         });
@@ -600,7 +677,7 @@ export default function BeatEngine({ briefBpm, briefKey, onBounce, onExportKerne
       alert("Bounce error: " + e.message);
     }
     setBouncing(false);
-  }, [transport, drums, instruments, master, onBounce, beatName]);
+  }, [transport, drums, instruments, master, grooveProfile, onBounce, beatName]);
 
   // ── Export Beat Kernel JSON ──
   const exportKernel = useCallback(() => {
@@ -613,6 +690,7 @@ export default function BeatEngine({ briefBpm, briefKey, onBounce, onExportKerne
         modified: new Date().toISOString(), genre_tags: [], description: "", song_kernel_ref: null,
       },
       transport, drums: { channels: drums }, instruments: { channels: instruments }, master,
+      groove_profile: grooveProfile,
       arrangement: { pattern_chain: ["A"], patterns: { A: { name: "Main", description: "Primary pattern" } } },
     };
     if (onExportKernel) onExportKernel(kernel);
@@ -621,7 +699,7 @@ export default function BeatEngine({ briefBpm, briefKey, onBounce, onExportKerne
     const a = document.createElement("a"); a.href = url;
     a.download = `beat-kernel-${beatName.replace(/\s+/g, "-").toLowerCase()}.json`;
     a.click(); URL.revokeObjectURL(url);
-  }, [transport, drums, instruments, master, beatName, artistName, onExportKernel]);
+  }, [transport, drums, instruments, master, grooveProfile, beatName, artistName, onExportKernel]);
 
   // ── Import Beat Kernel JSON ──
   const importKernel = useCallback((e) => {
@@ -636,6 +714,7 @@ export default function BeatEngine({ briefBpm, briefKey, onBounce, onExportKerne
         if (k.drums?.channels) setDrums(k.drums.channels);
         if (k.instruments?.channels) setInstruments(k.instruments.channels);
         if (k.master) setMaster(k.master);
+        if (k.groove_profile) { setGrooveProfile(k.groove_profile); setGroovePresetIdx(-1); }
         if (k.metadata?.name) setBeatName(k.metadata.name);
       } catch (err) { alert("Import error: " + err.message); }
     };
@@ -758,7 +837,7 @@ Rules:
     setAiGenerating(false);
   }, [apiKey, aiPrompt, playing, stopPlayback, onNeedApiKey]);
 
-  // ── Load Preset ──
+  // ── Load Preset (with matching groove profile) ──
   const loadPreset = (presetFn) => {
     if (playing) stopPlayback();
     const p = presetFn();
@@ -767,6 +846,25 @@ Rules:
     setInstruments(p.instruments);
     setMaster(p.master);
     setBeatName(p.label);
+    // Load matching groove profile if available
+    const grooveFactory = GROOVE_PRESET_MAP[p.label];
+    if (grooveFactory) {
+      setGrooveProfile(grooveFactory(p.transport.bpm));
+      const idx = GROOVE_PRESETS.findIndex(gp => gp.factory === grooveFactory);
+      setGroovePresetIdx(idx >= 0 ? idx : 0);
+    } else {
+      setGrooveProfile(createDefaultGrooveProfile(p.transport.bpm));
+      setGroovePresetIdx(0);
+    }
+  };
+
+  // ── Load Groove Preset ──
+  const loadGroovePreset = (idx) => {
+    const preset = GROOVE_PRESETS[idx];
+    if (preset) {
+      setGrooveProfile(preset.factory(transport.bpm));
+      setGroovePresetIdx(idx);
+    }
   };
 
   // ── Drum Grid Handlers ──
@@ -921,7 +1019,7 @@ Rules:
 
       {/* ── View Tabs ── */}
       <div style={{ display: "flex", gap: 4, marginBottom: 16 }}>
-        {[["drums","Drums"],["instruments","Instruments"],["mixer","Mixer"],["master","Master FX"]].map(([k,l]) => (
+        {[["drums","Drums"],["instruments","Instruments"],["mixer","Mixer"],["master","Master FX"],["groove","Groove"]].map(([k,l]) => (
           <button key={k} style={S.chip(view === k)} onClick={() => setView(k)}>{l}</button>
         ))}
       </div>
@@ -1176,6 +1274,317 @@ Rules:
                   <span style={{ fontSize: 9, color: "#888", width: 30, textAlign: "right" }}>{master.eq[k]}dB</span>
                 </div>
               ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── GROOVE VIEW ── */}
+      {view === "groove" && (
+        <div style={S.section}>
+          <div style={S.sTitle}>Groove Physics Engine</div>
+
+          {/* Groove Preset Selector */}
+          <div style={{ ...S.card, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+            <span style={{ fontSize: 10, color: "#666", fontWeight: 600, letterSpacing: 2, textTransform: "uppercase" }}>Profile:</span>
+            {GROOVE_PRESETS.map((gp, i) => (
+              <button key={i} style={S.chip(groovePresetIdx === i)} onClick={() => loadGroovePreset(i)}>
+                {gp.label}
+              </button>
+            ))}
+          </div>
+
+          {/* Groove Type & Core Controls */}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginTop: 12 }}>
+            {/* Core Settings */}
+            <div style={S.card}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: "#f59e0b", marginBottom: 10 }}>CORE SETTINGS</div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                <span style={{ fontSize: 9, color: "#666", width: 80 }}>Groove Type</span>
+                <select style={{ ...S.input, width: 140 }} value={grooveProfile.groove_type}
+                  onChange={e => setGrooveProfile(p => ({ ...p, groove_type: e.target.value }))}>
+                  <option value="linear">Linear</option>
+                  <option value="curved">Curved (Dilla)</option>
+                  <option value="stochastic">Stochastic (Live)</option>
+                  <option value="hardware_emulated">Hardware Emulated</option>
+                </select>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                <span style={{ fontSize: 9, color: "#666", width: 80 }}>Feel Bias</span>
+                <select style={{ ...S.input, width: 140 }} value={grooveProfile.feel_bias}
+                  onChange={e => setGrooveProfile(p => ({ ...p, feel_bias: e.target.value }))}>
+                  <option value="on_top">On Top</option>
+                  <option value="laid_back">Laid Back</option>
+                  <option value="ahead">Ahead</option>
+                  <option value="deep_pocket">Deep Pocket</option>
+                </select>
+              </div>
+              {[["groove_amount","Amount",0,1,0.05]].map(([k,l,mn,mx,st]) => (
+                <div key={k} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                  <span style={{ fontSize: 9, color: "#666", width: 80 }}>{l}</span>
+                  <input type="range" min={mn} max={mx} step={st} value={grooveProfile[k]}
+                    style={{ ...S.slider, flex: 1 }}
+                    onChange={e => setGrooveProfile(p => ({ ...p, [k]: +e.target.value }))} />
+                  <span style={{ fontSize: 9, color: "#888", width: 30, textAlign: "right" }}>{(grooveProfile[k] * 100).toFixed(0)}%</span>
+                </div>
+              ))}
+              <div style={{ marginTop: 8, padding: "6px 10px", background: "#111122", borderRadius: 4, fontSize: 9, color: "#666" }}>
+                Type: <strong style={{ color: "#f59e0b" }}>{grooveProfile.groove_type}</strong> |
+                Feel: <strong style={{ color: "#f59e0b" }}>{grooveProfile.feel_bias}</strong> |
+                Seed: <strong style={{ color: "#888" }}>{grooveProfile.randomization_seed}</strong>
+              </div>
+            </div>
+
+            {/* Per-Channel Offsets */}
+            <div style={S.card}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: "#f59e0b", marginBottom: 10 }}>CHANNEL TIMING (ms)</div>
+              {Object.entries(grooveProfile.channel_offsets || {}).map(([chId, cfg]) => (
+                <div key={chId} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
+                  <span style={{ fontSize: 9, color: "#888", width: 40, textTransform: "uppercase", fontWeight: 600 }}>{chId}</span>
+                  <input type="range" min={-20} max={30} step={0.5} value={cfg.timing_offset_ms || 0}
+                    style={{ ...S.slider, flex: 1 }}
+                    onChange={e => setGrooveProfile(p => ({
+                      ...p, channel_offsets: { ...p.channel_offsets, [chId]: { ...p.channel_offsets[chId], timing_offset_ms: +e.target.value } }
+                    }))} />
+                  <span style={{ fontSize: 9, color: cfg.timing_offset_ms > 0 ? "#ef4444" : cfg.timing_offset_ms < 0 ? "#22c55e" : "#888", width: 35, textAlign: "right", fontWeight: 600 }}>
+                    {cfg.timing_offset_ms > 0 ? "+" : ""}{(cfg.timing_offset_ms || 0).toFixed(1)}
+                  </span>
+                </div>
+              ))}
+              <div style={{ fontSize: 8, color: "#555", marginTop: 6 }}>
+                Negative = push (early) | Positive = drag (late) | BPM-scaled
+              </div>
+            </div>
+          </div>
+
+          {/* Drag Curve Controls (shown when groove_type is curved) */}
+          {grooveProfile.groove_type === "curved" && (
+            <div style={{ ...S.card, marginTop: 12 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                <span style={{ fontSize: 11, fontWeight: 700, color: "#f59e0b" }}>DRAG CURVE</span>
+                <button style={S.chip(grooveProfile.drag_curve?.enabled)}
+                  onClick={() => setGrooveProfile(p => ({ ...p, drag_curve: { ...p.drag_curve, enabled: !p.drag_curve?.enabled } }))}>
+                  {grooveProfile.drag_curve?.enabled ? "ON" : "OFF"}
+                </button>
+              </div>
+              {grooveProfile.drag_curve?.enabled && (<>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                  <span style={{ fontSize: 9, color: "#666", width: 90 }}>Drift Mode</span>
+                  <select style={{ ...S.input, width: 100 }} value={grooveProfile.drag_curve?.drift_mode || 'power'}
+                    onChange={e => setGrooveProfile(p => ({ ...p, drag_curve: { ...p.drag_curve, drift_mode: e.target.value } }))}>
+                    <option value="power">Power</option>
+                    <option value="log">Logarithmic</option>
+                    <option value="linear">Linear</option>
+                  </select>
+                </div>
+                {[
+                  ["drag_exponent", "Exponent (α)", 0.5, 2.0, 0.05],
+                  ["max_drag_ms", "Max Drag (ms)", 5, 50, 1],
+                ].map(([k,l,mn,mx,st]) => (
+                  <div key={k} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                    <span style={{ fontSize: 9, color: "#666", width: 90 }}>{l}</span>
+                    <input type="range" min={mn} max={mx} step={st} value={grooveProfile.drag_curve?.[k] || mn}
+                      style={{ ...S.slider, flex: 1 }}
+                      onChange={e => setGrooveProfile(p => ({ ...p, drag_curve: { ...p.drag_curve, [k]: +e.target.value } }))} />
+                    <span style={{ fontSize: 9, color: "#888", width: 35, textAlign: "right" }}>
+                      {(grooveProfile.drag_curve?.[k] || 0).toFixed(2)}
+                    </span>
+                  </div>
+                ))}
+                <div style={{ fontSize: 9, color: "#666", marginTop: 4 }}>
+                  <span style={{ fontSize: 10, fontWeight: 600, color: "#888" }}>Channel Scaling:</span>
+                </div>
+                {Object.entries(grooveProfile.drag_curve?.per_channel_scaling || {}).map(([chId, val]) => (
+                  <div key={chId} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 2 }}>
+                    <span style={{ fontSize: 8, color: "#666", width: 50, textTransform: "uppercase" }}>{chId}</span>
+                    <input type="range" min={0} max={1} step={0.05} value={val}
+                      style={{ ...S.slider, flex: 1 }}
+                      onChange={e => setGrooveProfile(p => ({
+                        ...p, drag_curve: { ...p.drag_curve, per_channel_scaling: { ...p.drag_curve.per_channel_scaling, [chId]: +e.target.value } }
+                      }))} />
+                    <span style={{ fontSize: 8, color: "#888", width: 25, textAlign: "right" }}>{(val * 100).toFixed(0)}%</span>
+                  </div>
+                ))}
+              </>)}
+            </div>
+          )}
+
+          {/* Hardware Emulation Controls */}
+          {grooveProfile.groove_type === "hardware_emulated" && (
+            <div style={{ ...S.card, marginTop: 12 }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: "#f59e0b", marginBottom: 10 }}>HARDWARE EMULATION</div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                <span style={{ fontSize: 9, color: "#666", width: 90 }}>PPQN</span>
+                <select style={{ ...S.input, width: 100 }} value={grooveProfile.hardware_emulation?.ppqn || 96}
+                  onChange={e => setGrooveProfile(p => ({ ...p, hardware_emulation: { ...p.hardware_emulation, ppqn: +e.target.value } }))}>
+                  <option value={24}>24 (Lo-Fi)</option>
+                  <option value={48}>48 (Classic)</option>
+                  <option value={96}>96 (MPC60)</option>
+                  <option value={192}>192 (High)</option>
+                  <option value={480}>480 (Modern)</option>
+                </select>
+              </div>
+              {[
+                ["bit_depth", "Bit Depth", 4, 24, 1],
+                ["sample_rate", "Sample Rate", 8000, 48000, 1000],
+              ].map(([k,l,mn,mx,st]) => (
+                <div key={k} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                  <span style={{ fontSize: 9, color: "#666", width: 90 }}>{l}</span>
+                  <input type="range" min={mn} max={mx} step={st} value={grooveProfile.hardware_emulation?.[k] || mn}
+                    style={{ ...S.slider, flex: 1 }}
+                    onChange={e => setGrooveProfile(p => ({ ...p, hardware_emulation: { ...p.hardware_emulation, [k]: +e.target.value } }))} />
+                  <span style={{ fontSize: 9, color: "#888", width: 45, textAlign: "right" }}>
+                    {k === "sample_rate" ? `${(grooveProfile.hardware_emulation?.[k] || 26040) / 1000}k` : grooveProfile.hardware_emulation?.[k] || mn}
+                  </span>
+                </div>
+              ))}
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                <span style={{ fontSize: 9, color: "#666", width: 90 }}>DAC Saturation</span>
+                <button style={S.chip(grooveProfile.hardware_emulation?.dac_saturation?.enabled)}
+                  onClick={() => setGrooveProfile(p => ({
+                    ...p, hardware_emulation: { ...p.hardware_emulation, dac_saturation: { ...p.hardware_emulation.dac_saturation, enabled: !p.hardware_emulation?.dac_saturation?.enabled } }
+                  }))}>
+                  {grooveProfile.hardware_emulation?.dac_saturation?.enabled ? "ON" : "OFF"}
+                </button>
+              </div>
+              {grooveProfile.hardware_emulation?.dac_saturation?.enabled && (
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                  <span style={{ fontSize: 9, color: "#666", width: 90 }}>Sat. Gain</span>
+                  <input type="range" min={0.5} max={4} step={0.1} value={grooveProfile.hardware_emulation?.dac_saturation?.gain || 1.2}
+                    style={{ ...S.slider, flex: 1 }}
+                    onChange={e => setGrooveProfile(p => ({
+                      ...p, hardware_emulation: { ...p.hardware_emulation, dac_saturation: { ...p.hardware_emulation.dac_saturation, gain: +e.target.value } }
+                    }))} />
+                  <span style={{ fontSize: 9, color: "#888", width: 30, textAlign: "right" }}>{(grooveProfile.hardware_emulation?.dac_saturation?.gain || 1.2).toFixed(1)}</span>
+                </div>
+              )}
+              <div style={{ fontSize: 8, color: "#555", marginTop: 6 }}>
+                Signal chain: Saturate → Filter → Downsample → Quantize (Rule 13)
+              </div>
+            </div>
+          )}
+
+          {/* Advanced: Temporal Coupling, Harmonic Gravity, Macro-Drift */}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginTop: 12 }}>
+            {/* Temporal Coupling */}
+            <div style={S.card}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                <span style={{ fontSize: 10, fontWeight: 700, color: "#f59e0b" }}>VEL-PHASE</span>
+                <button style={S.chip(grooveProfile.temporal_coupling?.enabled)}
+                  onClick={() => setGrooveProfile(p => ({ ...p, temporal_coupling: { ...p.temporal_coupling, enabled: !p.temporal_coupling?.enabled } }))}>
+                  {grooveProfile.temporal_coupling?.enabled ? "ON" : "OFF"}
+                </button>
+              </div>
+              {grooveProfile.temporal_coupling?.enabled && (<>
+                <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 4 }}>
+                  <span style={{ fontSize: 8, color: "#666", width: 50 }}>Ratio</span>
+                  <input type="range" min={-3} max={0} step={0.1} value={grooveProfile.temporal_coupling?.velocity_phase_ratio || -1}
+                    style={{ ...S.slider, flex: 1 }}
+                    onChange={e => setGrooveProfile(p => ({ ...p, temporal_coupling: { ...p.temporal_coupling, velocity_phase_ratio: +e.target.value } }))} />
+                  <span style={{ fontSize: 8, color: "#888", width: 25 }}>{(grooveProfile.temporal_coupling?.velocity_phase_ratio || -1).toFixed(1)}</span>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 4 }}>
+                  <span style={{ fontSize: 8, color: "#666", width: 50 }}>Dir</span>
+                  <select style={{ ...S.input, width: 80, fontSize: 9, padding: "3px 6px" }} value={grooveProfile.temporal_coupling?.direction || 'natural'}
+                    onChange={e => setGrooveProfile(p => ({ ...p, temporal_coupling: { ...p.temporal_coupling, direction: e.target.value } }))}>
+                    <option value="natural">Natural</option>
+                    <option value="inverted">Inverted</option>
+                    <option value="none">None</option>
+                  </select>
+                </div>
+                <div style={{ fontSize: 7, color: "#555" }}>Loud=early, Soft=late</div>
+              </>)}
+            </div>
+
+            {/* Harmonic Gravity */}
+            <div style={S.card}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                <span style={{ fontSize: 10, fontWeight: 700, color: "#f59e0b" }}>GRAVITY</span>
+                <button style={S.chip(grooveProfile.harmonic_gravity?.enabled)}
+                  onClick={() => setGrooveProfile(p => ({ ...p, harmonic_gravity: { ...p.harmonic_gravity, enabled: !p.harmonic_gravity?.enabled } }))}>
+                  {grooveProfile.harmonic_gravity?.enabled ? "ON" : "OFF"}
+                </button>
+              </div>
+              {grooveProfile.harmonic_gravity?.enabled && (
+                <div style={{ fontSize: 8, color: "#888" }}>
+                  {Object.entries(grooveProfile.harmonic_gravity?.gravity_by_mode || {}).filter(([m]) => ['major','minor','dorian','phrygian','mixolydian'].includes(m)).map(([mode, val]) => (
+                    <div key={mode} style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
+                      <span style={{ textTransform: "capitalize", color: mode === transport.scale ? "#f59e0b" : "#666" }}>{mode}</span>
+                      <span style={{ color: mode === transport.scale ? "#f59e0b" : "#888" }}>×{val.toFixed(2)}</span>
+                    </div>
+                  ))}
+                  <div style={{ fontSize: 7, color: "#555", marginTop: 4 }}>Current: {transport.scale} (×{(grooveProfile.harmonic_gravity?.gravity_by_mode?.[transport.scale] || 1.0).toFixed(2)})</div>
+                </div>
+              )}
+            </div>
+
+            {/* Macro-Drift */}
+            <div style={S.card}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                <span style={{ fontSize: 10, fontWeight: 700, color: "#f59e0b" }}>DRIFT</span>
+                <button style={S.chip(grooveProfile.macro_drift?.enabled)}
+                  onClick={() => setGrooveProfile(p => ({ ...p, macro_drift: { ...p.macro_drift, enabled: !p.macro_drift?.enabled } }))}>
+                  {grooveProfile.macro_drift?.enabled ? "ON" : "OFF"}
+                </button>
+              </div>
+              {grooveProfile.macro_drift?.enabled && (<>
+                {[
+                  ["amplitude_ms", "Amp (ms)", 1, 25, 1],
+                  ["period_bars", "Period", 2, 16, 1],
+                ].map(([k,l,mn,mx,st]) => (
+                  <div key={k} style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 3 }}>
+                    <span style={{ fontSize: 8, color: "#666", width: 50 }}>{l}</span>
+                    <input type="range" min={mn} max={mx} step={st} value={grooveProfile.macro_drift?.[k] || mn}
+                      style={{ ...S.slider, flex: 1 }}
+                      onChange={e => setGrooveProfile(p => ({ ...p, macro_drift: { ...p.macro_drift, [k]: +e.target.value } }))} />
+                    <span style={{ fontSize: 8, color: "#888", width: 20 }}>{grooveProfile.macro_drift?.[k] || mn}</span>
+                  </div>
+                ))}
+                <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                  <span style={{ fontSize: 8, color: "#666", width: 50 }}>Wave</span>
+                  <select style={{ ...S.input, width: 80, fontSize: 9, padding: "3px 6px" }} value={grooveProfile.macro_drift?.waveform || 'sine'}
+                    onChange={e => setGrooveProfile(p => ({ ...p, macro_drift: { ...p.macro_drift, waveform: e.target.value } }))}>
+                    <option value="sine">Sine</option>
+                    <option value="triangle">Triangle</option>
+                  </select>
+                </div>
+              </>)}
+            </div>
+          </div>
+
+          {/* Phrase Constraints */}
+          <div style={{ ...S.card, marginTop: 12 }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: "#f59e0b", marginBottom: 8 }}>PHRASE CONSTRAINTS (Safety Net)</div>
+            <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+              {[
+                ["phrase_length_bars", "Phrase (bars)", 2, 32, 1],
+                ["max_accumulated_phase_error_ms", "Max Error (ms)", 20, 80, 5],
+              ].map(([k,l,mn,mx,st]) => (
+                <div key={k} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ fontSize: 9, color: "#666" }}>{l}</span>
+                  <input type="range" min={mn} max={mx} step={st}
+                    value={grooveProfile.phrase_constraints?.[k] || mn}
+                    style={{ ...S.slider, width: 80 }}
+                    onChange={e => setGrooveProfile(p => ({
+                      ...p, phrase_constraints: { ...p.phrase_constraints, [k]: +e.target.value }
+                    }))} />
+                  <span style={{ fontSize: 9, color: "#888" }}>{grooveProfile.phrase_constraints?.[k] || mn}</span>
+                </div>
+              ))}
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <span style={{ fontSize: 9, color: "#666" }}>Reset</span>
+                <select style={{ ...S.input, width: 80, fontSize: 9, padding: "3px 6px" }}
+                  value={grooveProfile.phrase_constraints?.reset_mode || 'hard'}
+                  onChange={e => setGrooveProfile(p => ({
+                    ...p, phrase_constraints: { ...p.phrase_constraints, reset_mode: e.target.value }
+                  }))}>
+                  <option value="hard">Hard</option>
+                  <option value="soft">Soft</option>
+                </select>
+              </div>
+            </div>
+            <div style={{ fontSize: 8, color: "#555", marginTop: 6 }}>
+              All timing displacement is bounded, BPM-scaled, deterministic, and resets at phrase boundary.
             </div>
           </div>
         </div>
