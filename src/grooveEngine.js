@@ -1,38 +1,36 @@
 // ═══════════════════════════════════════════════════════════
 // GROOVE ENGINE — Layer 3: Event Scheduler
-// Deterministic Temporal Topology Engine
-// L0-CMD-2026-0216-006-A §3, §6
+// Unified Displacement Kernel Architecture
+// L0-CMD-2026-0216-007 §6.2, §6.3 (Deliverables D2, D3)
 // ═══════════════════════════════════════════════════════════
 //
-// Layer 3 orchestrates the complete timing pipeline:
-//   grid time
-//     → drag curve (if groove_type = 'curved')
-//     → swing (with curve differentiation)
-//     → microtiming offset (per-channel)
-//     → macro-drift (inter-bar breathing)
-//     → velocity-phase coupling
-//     → harmonic gravity (positive offsets only)
-//     → clamp by feel_bias (MAX_OFFSET_BY_FEEL)
-//     → groove amount (scale within clamped boundary)
-//     → PPQN rounding (if groove_type = 'hardware_emulated')
-//     → schedule to AudioWorklet
+// Layer 3 orchestrates the complete timing pipeline via the
+// Unified Displacement Kernel (grooveKernel.js):
 //
-// Engineering Rules (CMD-006 §9.3 + Amendment):
-//   Rule 12: groove_type dispatches to DIFFERENT code paths
-//   Rule 13: PPQN rounding occurs AFTER swing + curvature
-//   Rule 15: Tension variable τ ∈ [0, 1] — HARD BOUNDED
-//   Rule 16: Drag exponent α MUST be normalized
+//   1. Assemble coefficient context from groove profile
+//   2. Evaluate fΔ(context) — single closed-form displacement
+//   3. Apply PPQN rounding (coefficient-gated by ppqn value)
+//   4. Process velocity humanization + ghost notes
+//
+// ZERO groove_type conditionals in the displacement path.
+// Style character emerges from coefficient values alone.
+//
+// Engineering Rules (CMD-007 §8.1):
+//   Rule 19: Kernel is PURE — no mutation, no side effects
+//   Rule 20: ZERO groove_type conditionals inside kernel
+//   Rule 21: Γ(m) scales ONLY curvature + phase coupling
+//   Rule 22: β applied ONCE in kernel
+//   Rule 24: f(n,v) = Δ_C(n) + Ω(v) coupled before gravity
 
 import {
   computeDragCurve,
   computeLogDrift,
   velocityPhaseCoupling,
   computeMacroDrift,
-  applyHarmonicGravity,
   computeTensionState,
-  clampPhraseError,
 } from './grooveField.js';
 
+import { computeGrooveDisplacement } from './grooveKernel.js';
 import { roundToPPQN } from './hardwareEmulation.js';
 
 // ── Seeded PRNG (Mulberry32) ──
@@ -102,11 +100,132 @@ function resolveChannel(channelId) {
 }
 
 /**
- * Main groove pipeline. Computes the final timing displacement,
- * velocity modification, and play/skip decision for a single
- * event at a given step and channel.
+ * CONTEXT ASSEMBLY FUNCTION — D3 (CMD-007 §6.3)
  *
- * This is the heart of the Groove Physics Engine.
+ * Builds the coefficient context vector from a groove profile,
+ * step position, channel, and musical state. This is the bridge
+ * between profile configuration and the pure displacement kernel.
+ *
+ * All basis function outputs are UNSCALED (bpmScale=1).
+ * β is applied ONCE inside the kernel (Rule 22).
+ *
+ * @param {number} step - Current step index (0–15)
+ * @param {string} channelId - Channel identifier (e.g., 'kick', 'snare')
+ * @param {Object} grooveProfile - Complete groove profile object
+ * @param {number} barIndex - Current bar index (for macro-drift, tension)
+ * @param {SeededRNG|null} rng - Seeded random number generator
+ * @param {string} scaleMode - Current scale mode (e.g., 'minor', 'dorian')
+ * @param {number} baseVelocity - Original velocity of the event (0.0–1.0)
+ * @returns {Object} Coefficient context for computeGrooveDisplacement()
+ */
+export function assembleGrooveContext(step, channelId, grooveProfile, barIndex, rng, scaleMode, baseVelocity) {
+  const bpm = grooveProfile.bpm || 90;
+  const stepsPerBar = grooveProfile.steps_per_bar || 16;
+  const stepInBar = step % stepsPerBar;
+  const canonicalChannel = resolveChannel(channelId);
+
+  const channelOffsets = grooveProfile.channel_offsets || {};
+  const channelCfg = channelOffsets[canonicalChannel] || {};
+
+  // ── Δ_L — Linear offset (per-channel constant displacement, unscaled ms) ──
+  const linearOffset = channelCfg.timing_offset_ms || 0;
+
+  // ── Δ_C(n) — Topological curvature (unscaled ms) ──
+  // Coefficient-gated: drag_curve.enabled controls activation
+  let curvature = 0;
+  if (grooveProfile.drag_curve?.enabled) {
+    const dc = grooveProfile.drag_curve;
+    const channelScale = dc.per_channel_scaling?.[canonicalChannel] ?? 1.0;
+
+    const tensionState = computeTensionState(barIndex, grooveProfile.temporal_state);
+    const effectiveExponent = (dc.drag_exponent || 1.25) * tensionState.exponentMultiplier;
+
+    if (dc.drift_mode === 'log') {
+      // Pass bpmScale=1: kernel applies β
+      curvature = computeLogDrift(
+        stepInBar, stepsPerBar,
+        dc.max_drag_ms || 25,
+        dc.log_k || 4,
+        channelScale, 1
+      );
+    } else {
+      // Default: power curve. Pass bpmScale=1: kernel applies β
+      curvature = computeDragCurve(
+        stepInBar, stepsPerBar,
+        dc.max_drag_ms || 25,
+        effectiveExponent,
+        channelScale, 1
+      );
+    }
+  }
+
+  // ── Ω(v) — Velocity-phase coupling (unscaled ms) ──
+  // Coefficient-gated: temporal_coupling.enabled controls activation
+  let phaseCoupling = 0;
+  if (grooveProfile.temporal_coupling?.enabled && baseVelocity != null) {
+    const ratio = grooveProfile.temporal_coupling.velocity_phase_ratio || -1.0;
+    const direction = grooveProfile.temporal_coupling.direction || 'natural';
+    phaseCoupling = velocityPhaseCoupling(baseVelocity, ratio, direction);
+  }
+
+  // ── Γ(m) — Harmonic gravity multiplier (≥1.0) ──
+  // Coefficient-gated: harmonic_gravity.enabled controls activation
+  // Rule 21: Γ scales ONLY the elastic field (curvature + phaseCoupling)
+  let harmonicGravity = 1.0;
+  if (grooveProfile.harmonic_gravity?.enabled) {
+    const mode = scaleMode || 'minor';
+    harmonicGravity = grooveProfile.harmonic_gravity.gravity_by_mode?.[mode] ?? 1.0;
+  }
+
+  // ── Ψ(b) — Macro-drift (unscaled ms) ──
+  // Coefficient-gated: macro_drift.enabled controls activation
+  let macroDrift = 0;
+  if (grooveProfile.macro_drift?.enabled) {
+    // Pass bpmScale=1: kernel applies β
+    macroDrift = computeMacroDrift(barIndex, grooveProfile.macro_drift, 1);
+  }
+
+  // ── σ·G — Stochastic jitter (unscaled ms) ──
+  // Coefficient-gated: jitter_ms > 0 controls activation (no groove_type check)
+  let jitter = 0;
+  if (rng) {
+    const sigma = channelCfg.jitter_ms || 0;
+    if (sigma > 0) {
+      jitter = sigma * rng.gaussian();
+    }
+  }
+
+  // ── Feel bias limits (unscaled ms) ──
+  const feelBias = grooveProfile.feel_bias || 'laid_back';
+  const feelLimits = MAX_OFFSET_BY_FEEL[feelBias] || MAX_OFFSET_BY_FEEL.laid_back;
+
+  // ── Phrase constraint ceiling (unscaled ms) ──
+  const maxPhaseErrorMs = grooveProfile.phrase_constraints?.max_accumulated_phase_error_ms || 0;
+
+  return {
+    bpm,
+    grooveAmount: grooveProfile.groove_amount ?? 1.0,
+    linearOffset,
+    curvature,
+    phaseCoupling,
+    harmonicGravity,
+    macroDrift,
+    jitter,
+    maxPushMs: feelLimits.push,
+    maxDragMs: feelLimits.drag,
+    maxPhaseErrorMs,
+  };
+}
+
+/**
+ * Main groove pipeline — D2 (CMD-007 §6.2)
+ *
+ * Computes the final timing displacement, velocity modification,
+ * and play/skip decision for a single event at a given step and channel.
+ *
+ * ZERO groove_type conditionals. All displacement flows through
+ * assembleGrooveContext() → computeGrooveDisplacement().
+ * PPQN rounding is coefficient-gated by ppqn value.
  *
  * @param {number} gridTime - Base grid time in seconds
  * @param {number} step - Current step index (0–15)
@@ -125,118 +244,43 @@ export function applyGroove(gridTime, step, channelId, grooveProfile, barIndex, 
   }
 
   const bpm = grooveProfile.bpm || 90;
-  const bpmScale = 90 / bpm;
-  const grooveType = grooveProfile.groove_type || 'linear';
-  const stepsPerBar = grooveProfile.steps_per_bar || 16;
-  const stepInBar = step % stepsPerBar;
   const canonicalChannel = resolveChannel(channelId);
-
-  // Get per-channel config
   const channelOffsets = grooveProfile.channel_offsets || {};
   const channelCfg = channelOffsets[canonicalChannel] || {};
 
-  let offsetMs = 0;
+  // ── 1. Assemble coefficient context ──
+  const ctx = assembleGrooveContext(step, channelId, grooveProfile, barIndex, rng, scaleMode, baseVelocity);
+
+  // ── 2. Evaluate unified displacement kernel (pure math) ──
+  const offsetMs = computeGrooveDisplacement(ctx);
+
+  // ── 3. Velocity humanization (side effect — uses RNG) ──
   let velocity = baseVelocity;
-
-  // ── 1. Drag Curve (groove_type = 'curved' ONLY — Rule 12) ──
-  if (grooveType === 'curved' && grooveProfile.drag_curve?.enabled) {
-    const dc = grooveProfile.drag_curve;
-    const channelScale = dc.per_channel_scaling?.[canonicalChannel] ?? 1.0;
-
-    // Apply tension state to drag exponent (Phase 3 feature, ready if enabled)
-    const tensionState = computeTensionState(barIndex, grooveProfile.temporal_state);
-    const effectiveExponent = (dc.drag_exponent || 1.25) * tensionState.exponentMultiplier;
-
-    if (dc.drift_mode === 'log') {
-      offsetMs += computeLogDrift(
-        stepInBar, stepsPerBar,
-        dc.max_drag_ms || 25,
-        dc.log_k || 4,
-        channelScale, bpmScale
-      );
-    } else {
-      // Default: power curve
-      offsetMs += computeDragCurve(
-        stepInBar, stepsPerBar,
-        dc.max_drag_ms || 25,
-        effectiveExponent,
-        channelScale, bpmScale
-      );
-    }
-
-    // Bar-boundary snapback (handled by using stepInBar which resets at bar boundary)
-  }
-
-  // ── 2. Swing is applied by the caller (existing transport system) ──
-  // The caller's swing already modifies the grid time before passing it here.
-  // We do NOT re-apply swing in this pipeline.
-
-  // ── 3. Microtiming offset (per-channel constant displacement) ──
-  const timingOffset = channelCfg.timing_offset_ms || 0;
-  offsetMs += timingOffset * bpmScale;
-
-  // ── 4. Macro-drift (inter-bar breathing) ──
-  if (grooveProfile.macro_drift?.enabled) {
-    offsetMs += computeMacroDrift(barIndex, grooveProfile.macro_drift, bpmScale);
-  }
-
-  // ── 5. Velocity-phase coupling ──
-  if (grooveProfile.temporal_coupling?.enabled && baseVelocity != null) {
-    const ratio = grooveProfile.temporal_coupling.velocity_phase_ratio || -1.0;
-    const direction = grooveProfile.temporal_coupling.direction || 'natural';
-    offsetMs += velocityPhaseCoupling(baseVelocity, ratio, direction);
-  }
-
-  // ── 6. Stochastic jitter (groove_type = 'stochastic' ONLY — Rule 12) ──
-  if (grooveType === 'stochastic' && rng) {
-    const sigma = channelCfg.jitter_ms || 3;
-    offsetMs += sigma * rng.gaussian() * bpmScale;
-  }
-
-  // ── 7. Harmonic gravity (positive offsets only) ──
-  if (grooveProfile.harmonic_gravity?.enabled) {
-    offsetMs = applyHarmonicGravity(offsetMs, grooveProfile.harmonic_gravity, scaleMode);
-  }
-
-  // ── 8. Phrase constraint safety net ──
-  offsetMs = clampPhraseError(offsetMs, grooveProfile.phrase_constraints, bpmScale);
-
-  // ── 9. Clamp by feel_bias ──
-  const feelBias = grooveProfile.feel_bias || 'laid_back';
-  const feelLimits = MAX_OFFSET_BY_FEEL[feelBias] || MAX_OFFSET_BY_FEEL.laid_back;
-  offsetMs = Math.max(
-    feelLimits.push * bpmScale,
-    Math.min(feelLimits.drag * bpmScale, offsetMs)
-  );
-
-  // ── 10. Scale by groove_amount (within clamped boundary) ──
-  offsetMs *= (grooveProfile.groove_amount ?? 1.0);
-
-  // ── 11. Velocity humanization ──
   if (channelCfg.velocity_variance && rng && baseVelocity != null) {
     const variance = channelCfg.velocity_variance;
     const mod = rng.gaussian() * variance;
     velocity = Math.max(0.05, Math.min(1.0, baseVelocity + mod));
   }
 
-  // ── 12. Ghost note processing ──
+  // ── 4. Ghost note processing (side effect — uses RNG) ──
   let shouldPlay = true;
   if (channelCfg.ghost_note_probability && rng) {
     const ghostProb = channelCfg.ghost_note_probability;
     if (rng.next() < ghostProb) {
-      // This step becomes a ghost note — reduce velocity
       const attenuation = channelCfg.ghost_note_attenuation_db || -12;
       const scale = Math.pow(10, attenuation / 20);
       velocity = baseVelocity * scale;
     }
   }
 
-  // ── 13. Compute final time ──
+  // ── 5. Compute final time ──
   let finalTime = gridTime + (offsetMs / 1000);
 
-  // ── 14. PPQN rounding (groove_type = 'hardware_emulated' ONLY — Rule 13) ──
-  if (grooveType === 'hardware_emulated' && grooveProfile.hardware_emulation?.ppqn) {
-    finalTime = roundToPPQN(finalTime, bpm, grooveProfile.hardware_emulation.ppqn);
+  // ── 6. PPQN rounding — coefficient-gated (Rule 20: no groove_type check) ──
+  // ppqn > 0 activates rounding. ppqn = 0 means no hardware quantization.
+  const ppqn = grooveProfile.hardware_emulation?.ppqn || 0;
+  if (ppqn > 0) {
+    finalTime = roundToPPQN(finalTime, bpm, ppqn);
   }
 
   // Ensure time never goes negative
@@ -246,18 +290,12 @@ export function applyGroove(gridTime, step, channelId, grooveProfile, barIndex, 
 }
 
 /**
- * Computes swing offset for a given step. This enhances the
- * existing swing implementation with curve-differentiated swing
- * (different swing curves for different groove types).
- *
- * For 'linear' groove_type: standard even/odd swing
- * For 'curved' groove_type: swing amount varies with drag position
- * For 'hardware_emulated': swing gets PPQN-rounded (handled later)
+ * Computes swing offset for a given step.
  *
  * @param {number} step - Current step index
  * @param {number} secPerStep - Base seconds per step (no swing)
  * @param {number} swing - Swing amount (0.0–0.5)
- * @param {string} grooveType - Current groove type
+ * @param {string} grooveType - Retained for API compatibility (unused)
  * @returns {number} Step duration in seconds (with swing applied)
  */
 export function computeSwingDuration(step, secPerStep, swing, grooveType) {
@@ -271,15 +309,16 @@ export function computeSwingDuration(step, secPerStep, swing, grooveType) {
 }
 
 /**
- * Creates a default groove profile with linear (no displacement) settings.
+ * Creates a default groove profile with zero displacement settings.
  * All displacements are zero — pure grid timing.
+ * groove_type retained as metadata only (not used for dispatch).
  *
  * @param {number} bpm - BPM for this profile
  * @returns {Object} Default groove profile
  */
 export function createDefaultGrooveProfile(bpm = 90) {
   return {
-    groove_type: 'linear',
+    groove_type: 'linear',  // Metadata only — not used for dispatch
     groove_amount: 1.0,
     feel_bias: 'laid_back',
     bpm: bpm,
@@ -295,7 +334,7 @@ export function createDefaultGrooveProfile(bpm = 90) {
       keys:  { timing_offset_ms: 0, velocity_variance: 0, jitter_ms: 0, ghost_note_probability: 0 },
     },
 
-    // Drag curve (disabled for linear)
+    // Drag curve (disabled — curvature coefficient = 0)
     drag_curve: {
       enabled: false,
       drift_mode: 'power',
@@ -312,9 +351,9 @@ export function createDefaultGrooveProfile(bpm = 90) {
       },
     },
 
-    // Hardware emulation (disabled for linear)
+    // Hardware emulation (ppqn=0 means no PPQN rounding)
     hardware_emulation: {
-      ppqn: 96,
+      ppqn: 0,
       signal_chain_order: 'saturate_downsample_quantize',
       dac_saturation: { enabled: false, curve: 'tanh', gain: 1.2 },
       anti_alias_filter: { type: 'chebyshev_type1', cutoff_hz: 18000, ripple_db: 0.5 },
@@ -322,14 +361,14 @@ export function createDefaultGrooveProfile(bpm = 90) {
       bit_depth: 12,
     },
 
-    // Temporal coupling (disabled)
+    // Temporal coupling (disabled — phaseCoupling coefficient = 0)
     temporal_coupling: {
       enabled: false,
       velocity_phase_ratio: -1.0,
       direction: 'natural',
     },
 
-    // Harmonic gravity (disabled)
+    // Harmonic gravity (disabled — Γ = 1.0)
     harmonic_gravity: {
       enabled: false,
       gravity_by_mode: {
@@ -344,7 +383,7 @@ export function createDefaultGrooveProfile(bpm = 90) {
       },
     },
 
-    // Macro-drift (disabled)
+    // Macro-drift (disabled — Ψ coefficient = 0)
     macro_drift: {
       enabled: false,
       amplitude_ms: 12,

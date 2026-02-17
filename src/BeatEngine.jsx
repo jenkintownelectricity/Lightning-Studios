@@ -545,9 +545,10 @@ export default function BeatEngine({ briefBpm, briefKey, onBounce, onExportKerne
     const actx = new (window.AudioContext || window.webkitAudioContext)();
     actxRef.current = actx;
 
-    // Initialize lo-fi AudioWorklet for hardware_emulated profiles
+    // Initialize lo-fi AudioWorklet — coefficient-gated by dac_saturation.enabled
+    // (CMD-007: no groove_type branching — style from coefficients only)
     const gp = grooveProfileRef.current;
-    if (gp?.groove_type === 'hardware_emulated' && gp?.hardware_emulation?.dac_saturation?.enabled) {
+    if (gp?.hardware_emulation?.dac_saturation?.enabled) {
       try {
         const workletUrl = new URL('./lofi-processor.worklet.js', import.meta.url).href;
         await actx.audioWorklet.addModule(workletUrl);
@@ -1357,8 +1358,8 @@ Rules:
             </div>
           </div>
 
-          {/* Drag Curve Controls (shown when groove_type is curved) */}
-          {grooveProfile.groove_type === "curved" && (
+          {/* Drag Curve Controls — always visible, coefficient-gated via enabled toggle */}
+          {(
             <div style={{ ...S.card, marginTop: 12 }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
                 <span style={{ fontSize: 11, fontWeight: 700, color: "#f59e0b" }}>DRAG CURVE</span>
@@ -1409,8 +1410,8 @@ Rules:
             </div>
           )}
 
-          {/* Hardware Emulation Controls */}
-          {grooveProfile.groove_type === "hardware_emulated" && (
+          {/* Hardware Emulation Controls — always visible, coefficient-gated */}
+          {(
             <div style={{ ...S.card, marginTop: 12 }}>
               <div style={{ fontSize: 11, fontWeight: 700, color: "#f59e0b", marginBottom: 10 }}>HARDWARE EMULATION</div>
               <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
