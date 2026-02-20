@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from "react";
-import { applyGroove, SeededRNG, createDefaultGrooveProfile } from './grooveEngine.js';
+import { applyGroove, SeededRNG, createDefaultGrooveProfile, computeGrooveHash } from './grooveEngine.js';
 import { GROOVE_PRESETS, GROOVE_PRESET_MAP } from './grooveProfiles.js';
 
 // ═══════════════════════════════════════════════════════════
@@ -681,7 +681,7 @@ export default function BeatEngine({ briefBpm, briefKey, onBounce, onExportKerne
   }, [transport, drums, instruments, master, grooveProfile, onBounce, beatName]);
 
   // ── Export Beat Kernel JSON ──
-  const exportKernel = useCallback(() => {
+  const exportKernel = useCallback(async () => {
     const kernel = {
       schema_version: "beat-kernel-v1",
       kernel_type: "beat",
@@ -692,8 +692,13 @@ export default function BeatEngine({ briefBpm, briefKey, onBounce, onExportKerne
       },
       transport, drums: { channels: drums }, instruments: { channels: instruments }, master,
       groove_profile: grooveProfile,
+      randomization_seed: grooveProfile?.randomization_seed ?? 42,
+      groove_hash: null,
       arrangement: { pattern_chain: ["A"], patterns: { A: { name: "Main", description: "Primary pattern" } } },
     };
+    if (grooveProfile && crypto?.subtle) {
+      try { kernel.groove_hash = await computeGrooveHash(grooveProfile); } catch (e) { /* continue without hash */ }
+    }
     if (onExportKernel) onExportKernel(kernel);
     const blob = new Blob([JSON.stringify(kernel, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -707,7 +712,7 @@ export default function BeatEngine({ briefBpm, briefKey, onBounce, onExportKerne
     const file = e.target.files[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = (ev) => {
+    reader.onload = async (ev) => {
       try {
         const k = JSON.parse(ev.target.result);
         if (k.schema_version !== "beat-kernel-v1") throw new Error("Not a Beat Kernel v1 file");
@@ -715,7 +720,21 @@ export default function BeatEngine({ briefBpm, briefKey, onBounce, onExportKerne
         if (k.drums?.channels) setDrums(k.drums.channels);
         if (k.instruments?.channels) setInstruments(k.instruments.channels);
         if (k.master) setMaster(k.master);
-        if (k.groove_profile) { setGrooveProfile(k.groove_profile); setGroovePresetIdx(-1); }
+        if (k.groove_profile) {
+          setGrooveProfile(k.groove_profile); setGroovePresetIdx(-1);
+          if (k.groove_hash) {
+            if (!crypto?.subtle) {
+              console.warn('[GrooveHashUnavailable] crypto.subtle not available');
+            } else {
+              try {
+                const actual = await computeGrooveHash(k.groove_profile);
+                if (actual !== k.groove_hash) {
+                  console.warn(`[GrooveHashMismatch] expected=${k.groove_hash} actual=${actual}`);
+                }
+              } catch (he) { /* hash verification failed, continue */ }
+            }
+          }
+        }
         if (k.metadata?.name) setBeatName(k.metadata.name);
       } catch (err) { alert("Import error: " + err.message); }
     };

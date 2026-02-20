@@ -431,3 +431,32 @@ export function createDefaultGrooveProfile(bpm = 90) {
     },
   };
 }
+
+// ── Deterministic Groove Hashing (SHA-256) ──
+
+/**
+ * Recursively sorts object keys for deterministic serialization.
+ * Arrays preserve order; primitives pass through unchanged.
+ */
+export function stableStringify(obj) {
+  if (obj === null || typeof obj !== 'object') return JSON.stringify(obj);
+  if (Array.isArray(obj)) return '[' + obj.map(v => stableStringify(v)).join(',') + ']';
+  const keys = Object.keys(obj).sort();
+  return '{' + keys.map(k => JSON.stringify(k) + ':' + stableStringify(obj[k])).join(',') + '}';
+}
+
+function bytesToHex(buffer) {
+  return Array.from(new Uint8Array(buffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * Computes SHA-256 hex hash of a groove profile using Web Crypto.
+ * @param {Object} grooveProfile - Complete groove profile object
+ * @returns {Promise<string>} Lowercase hex SHA-256 hash
+ */
+export async function computeGrooveHash(grooveProfile) {
+  const json = stableStringify(grooveProfile);
+  const bytes = new TextEncoder().encode(json);
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return bytesToHex(digest);
+}

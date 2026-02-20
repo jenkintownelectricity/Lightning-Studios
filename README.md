@@ -8,7 +8,8 @@ Browser-based music production app. Vite + React. Web Audio API synthesis. Zero 
 - **Melodic Instruments** — Bass, piano, strings, lead, pluck with Web Audio synthesis
 - **Groove Physics Engine** — Deterministic temporal topology engine (see below)
 - **AI Beat Generator** — Natural language to beat pattern via Claude API
-- **Beat Kernel JSON** — Full beat DNA serialization (transport, drums, instruments, master FX)
+- **Beat Kernel JSON** — Full beat DNA serialization (transport, drums, instruments, master FX) with SHA-256 integrity hash
+- **Groove Hash** — Deterministic SHA-256 fingerprint for Beat Kernel exports (tamper detection, key-order-independent)
 - **Song Kernel Integration** — Beat kernel cross-references in Production Genome export
 - **Master Effects** — Compressor, EQ, reverb, delay, stereo width, limiter
 - **Bounce to WAV** — Offline render with groove physics applied
@@ -21,6 +22,7 @@ npm install
 npm run dev        # Development server
 npm run build      # Production build
 npm run preview    # Preview production build
+npm run test       # Run Vitest test suite
 ```
 
 ## Tech Stack
@@ -29,8 +31,10 @@ npm run preview    # Preview production build
 |-------|-----------|
 | UI | React 18 (single-file component) |
 | Build | Vite 5 |
+| Testing | Vitest 4.0 |
 | Audio | Web Audio API + AudioWorklet |
 | Synthesis | Oscillator-based (no samples) |
+| Hashing | Web Crypto API (SHA-256 via `crypto.subtle.digest`) |
 | State | React hooks (useState, useRef, useCallback) |
 
 ---
@@ -121,13 +125,45 @@ No `groove_type` conditional branching in the displacement pipeline. Features ac
 
 ```
 src/
-  grooveKernel.js          Pure displacement kernel (fΔ) — zero branching
-  grooveEngine.js          Context assembly + applyGroove() scheduler
-  grooveField.js           Layer 2 basis functions (drag, drift, coupling, gravity)
-  hardwareEmulation.js     Layer 4 PPQN rounding + hardware presets
-  grooveProfiles.js        12 genre-specific coefficient profiles
-  lofi-processor.worklet.js Layer 5 AudioWorklet (bit-crush, downsample, saturation)
-  BeatEngine.jsx           Main React component (sequencer, synthesis, UI, groove integration)
+  grooveKernel.js            Pure displacement kernel (fΔ) — zero branching
+  grooveEngine.js            Context assembly + applyGroove() scheduler + SHA-256 groove hash
+  grooveField.js             Layer 2 basis functions (drag, drift, coupling, gravity)
+  hardwareEmulation.js       Layer 4 PPQN rounding + hardware presets
+  grooveProfiles.js          12 genre-specific coefficient profiles
+  lofi-processor.worklet.js  Layer 5 AudioWorklet (bit-crush, downsample, saturation)
+  BeatEngine.jsx             Main React component (sequencer, synthesis, UI, groove integration)
+  grooveHash.test.js         Vitest suite — groove hash integrity verification (7 tests)
+```
+
+---
+
+## Groove Hash — Beat Kernel Integrity
+
+SHA-256 fingerprint embedded in every Beat Kernel export. Enables tamper detection on import.
+
+### How It Works
+
+1. **Export** — `computeGrooveHash()` serializes the Beat Kernel via `stableStringify()` (deterministic key ordering), hashes with SHA-256 via Web Crypto, and stores the 64-char hex digest as `groove_hash`
+2. **Import** — On load, the hash is recomputed and compared. Mismatch triggers a console warning (non-blocking)
+3. **Determinism** — Key-order-independent: `{a:1, b:2}` and `{b:2, a:1}` produce identical hashes
+4. **Graceful degradation** — If `crypto.subtle` is unavailable (e.g., non-HTTPS), hashing is skipped with a warning. Never halts execution.
+
+### Test Suite
+
+`src/grooveHash.test.js` — 7 Vitest assertions:
+
+| Test | Verifies |
+|------|----------|
+| Export includes `groove_hash` | 64-char lowercase hex string present |
+| Randomization seed included | `randomization_seed` field in export |
+| `stableStringify` determinism | Key-order-independent serialization |
+| SHA-256 consistency | Same input always produces same hash |
+| Tamper detection | Modified payload triggers mismatch warning |
+| Key-order independence | Reordered objects hash identically |
+| Non-blocking on missing crypto | Logs warning, never throws |
+
+```bash
+npm run test    # Run full suite
 ```
 
 ---
@@ -141,6 +177,8 @@ src/
 | L0-CMD-2026-0216-006-A | 2026-02-16 | Groove Physics Engine — 5-layer architecture, 7 errata |
 | L0-CMD-2026-0216-007 | 2026-02-16 | Unified Displacement Kernel — eliminate groove_type branching |
 | L0-CMD-2026-0217-008 | 2026-02-17 | Documentation update (this README + session log) |
+| L0-CMD-2026-0220-009 | 2026-02-20 | Groove Hash (SHA-256) + integrity test suite |
+| L0-CMD-2026-0220-010 | 2026-02-20 | Documentation update (README + session log for groove hash) |
 
 ## License
 
