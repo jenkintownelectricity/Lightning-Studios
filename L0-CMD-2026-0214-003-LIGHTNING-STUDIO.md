@@ -166,4 +166,60 @@ T_final = Quantize_PPQN(T_grid + β·[Δ_L + Γ(m)·(Δ_C(n) + Ω(v)) + Ψ(b) + 
 
 ---
 
+### 2026-02-20 — Groove Hash + Integrity Test Suite
+
+#### L0-CMD-2026-0220-009 | Groove Hash (SHA-256 Beat Kernel Integrity)
+
+**Status: COMPLETE**
+
+Added deterministic SHA-256 integrity hashing to Beat Kernel export/import pipeline.
+
+**Implementation:**
+- `stableStringify()` — Deterministic JSON serialization (recursive key sorting, key-order-independent)
+- `computeGrooveHash()` — SHA-256 via Web Crypto API (`crypto.subtle.digest`), returns 64-char lowercase hex
+- Export: `groove_hash` field appended to Beat Kernel JSON alongside `randomization_seed`
+- Import: Hash recomputed on load, mismatch triggers console warning (non-blocking)
+- Graceful degradation: Missing `crypto.subtle` (non-HTTPS) logs warning, never halts execution
+
+**Files Modified:**
+- `src/grooveEngine.js` — Added `stableStringify()`, `computeGrooveHash()`, integrated into export/import
+
+#### Groove Hash Test Suite (Vitest)
+
+**Status: COMPLETE**
+
+Added 7-assertion Vitest test suite verifying groove hash integrity pipeline.
+
+**Test Coverage:**
+- Exported JSON includes `groove_hash` as 64-char lowercase hex string
+- Randomization seed included in export
+- `stableStringify` produces deterministic output (key-order-independent)
+- SHA-256 hash consistency (same input → same hash)
+- Tamper detection (modified payload triggers mismatch warning)
+- Key-order-independent hashing (`{a:1, b:2}` === `{b:2, a:1}`)
+- Non-blocking behavior when `crypto.subtle` unavailable
+
+**Files Created:**
+- `src/grooveHash.test.js` — 175 lines, 7 Vitest assertions
+
+### Commits (claude/add-groove-physics-engine-0GiJk)
+
+```
+8e09862 feat: add deterministic groove_hash (SHA-256) to Beat Kernel export/import
+753bb5d test: add groove hash integrity verification test suite
+```
+
+---
+
+### 2026-02-20 — Documentation Update
+
+#### L0-CMD-2026-0220-010 | README + Session Log
+
+**Status: COMPLETE**
+
+- Updated `README.md` with groove hash feature, test suite section, updated tech stack (Vitest, Web Crypto), expanded file manifest
+- Updated session log (`L0-CMD-2026-0214-003-LIGHTNING-STUDIO.md`) with CMD-009 and CMD-010 entries
+
+---
+
 **AUTHORIZATION: ARMAND LEFEBVRE — L0 ROOT — EXECUTE IMMEDIATELY**
