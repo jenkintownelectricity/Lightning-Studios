@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from "react";
+import { EMOTION_BASIS, createNeutralEmotionVector } from "./src/emotionField.js";
 
 // ═══════════════════════════════════════════════════════════
 // ⚡ LIGHTNING STUDIO — Music Production Kernel
@@ -145,6 +146,9 @@ export default function LightningStudio() {
   const [lyrics, setLyrics] = useState("");
   const [lyricsLoading, setLyricsLoading] = useState(false);
   const [lyricsPrompt, setLyricsPrompt] = useState("");
+
+  // Emotional field state — D5 (VK-CMD-EMOTION-PHYSICS-2026-002)
+  const [emotionVector, setEmotionVector] = useState(createNeutralEmotionVector);
 
   // Studio state
   const [isRecording, setIsRecording] = useState(false);
@@ -775,8 +779,42 @@ Write album-quality lyrics. Every bar must earn its place. No filler. No placeho
   // ═══════════════════════════════════════════════════════════
   const renderMix = () => (
     <div style={{ animation: "fadeIn 0.3s ease" }}>
+      {/* ── D5 — Emotional Field Controls (VK-CMD-EMOTION-PHYSICS-2026-002) ── */}
       <div style={S.section}>
-        <div style={S.sectionTitle}>🎛️ Mixing Console — {tracks.length} Tracks</div>
+        <div style={{ ...S.sectionTitle, color: "#888" }}>EMOTIONAL FIELD</div>
+        <div style={S.card}>
+          {EMOTION_BASIS.map((dim, i) => (
+            <div key={dim} style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: i < EMOTION_BASIS.length - 1 ? 10 : 0 }}>
+              <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: 2, color: "#666", minWidth: 110, textTransform: "uppercase", fontFamily: "inherit" }}>
+                E{i + 1} {dim}
+              </span>
+              <input
+                type="range" min="0" max="1" step="0.01"
+                value={emotionVector[dim]}
+                onChange={e => setEmotionVector(prev => ({ ...prev, [dim]: parseFloat(e.target.value) }))}
+                style={{ ...S.slider, flex: 1 }}
+              />
+              <span style={{ fontSize: 11, color: "#888", minWidth: 36, textAlign: "right", fontFamily: "inherit" }}>
+                {emotionVector[dim].toFixed(2)}
+              </span>
+            </div>
+          ))}
+          <div style={{ display: "flex", gap: 12, marginTop: 12, alignItems: "center" }}>
+            <button
+              style={{ ...S.btn("ghost"), padding: "6px 14px", fontSize: 10 }}
+              onClick={() => setEmotionVector(createNeutralEmotionVector())}
+            >
+              RESET TO ZERO
+            </button>
+            <span style={{ fontSize: 9, color: "#444", letterSpacing: 1 }}>
+              CONTINUOUS SCALAR FIELD — COEFFICIENT BIAS ONLY
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <div style={S.section}>
+        <div style={S.sectionTitle}>MIXING CONSOLE — {tracks.length} TRACKS</div>
         {tracks.length === 0 ? (
           <div style={S.empty}>
             No tracks loaded. Go to the <span style={{ color: "#f59e0b", cursor: "pointer" }} onClick={() => setTab("studio")}>Recording Studio</span> to record vocals or upload beats, then add them to the mix.
