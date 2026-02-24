@@ -32,6 +32,7 @@ import {
 
 import { computeGrooveDisplacement } from './grooveKernel.js';
 import { roundToPPQN } from './hardwareEmulation.js';
+import { applyEmotionalBias } from './emotionField.js';
 
 // ── Seeded PRNG (Mulberry32) ──
 // Invariant: DETERMINISTIC. Same seed = same output. No Math.random().
@@ -251,8 +252,12 @@ export function applyGroove(gridTime, step, channelId, grooveProfile, barIndex, 
   // ── 1. Assemble coefficient context ──
   const ctx = assembleGrooveContext(step, channelId, grooveProfile, barIndex, rng, scaleMode, baseVelocity);
 
+  // ── 1.5. Emotional Field Bias — single injection point (D3) ──
+  // Pipeline: Groove Field → Emotional Field Bias → Unified Displacement Kernel
+  const biasedCtx = applyEmotionalBias(ctx, grooveProfile.emotion_vector);
+
   // ── 2. Evaluate unified displacement kernel (pure math) ──
-  const offsetMs = computeGrooveDisplacement(ctx);
+  const offsetMs = computeGrooveDisplacement(biasedCtx);
 
   // ── 3. Velocity humanization (side effect — uses RNG) ──
   let velocity = baseVelocity;
@@ -397,6 +402,16 @@ export function createDefaultGrooveProfile(bpm = 90) {
       reset_mode: 'hard',
       max_accumulated_phase_error_ms: 50,
       snap_back_attack_ms: 20,
+    },
+
+    // Emotional field — neutral vector (zero bias on all coefficients)
+    // VK-CMD-EMOTION-PHYSICS-2026-002 D1/D4
+    emotion_vector: {
+      loneliness: 0.0,
+      tension: 0.0,
+      admiration: 0.0,
+      defiance: 0.0,
+      calm: 0.0,
     },
 
     // Temporal state / tension (Phase 3, disabled)
